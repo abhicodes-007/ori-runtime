@@ -1454,10 +1454,15 @@ def _parse_skills(data: Any) -> list[SkillConfig]:
                 "actions."
             )
 
+        version = _require_optional_str(
+            item.get("version"),
+            f"skills[{i}].version",
+            skill_name=name,
+        )
         skills.append(
             SkillConfig(
                 name=name,
-                version=str(item.get("version", "")),
+                version=version,
                 config={},
             )
         )
@@ -3550,3 +3555,21 @@ def _require_str(data: dict, key: str, context: str) -> str:
     if value is None:
         raise ConfigValidationError(f"'{context}.{key}' is required but missing.")
     return str(value)
+
+
+def _require_optional_str(value: Any, context: str, *, skill_name: str = "") -> str:
+    """Return *value* when it is a string (or absent → empty string).
+
+    Non-string types are refused rather than coerced with ``str()``: a mapping
+    like ``version: {actions: [trip_relay]}`` would otherwise load as the
+    string of that mapping and look like a real version to every reader.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    named = f" (skill {skill_name!r})" if skill_name else ""
+    raise ConfigValidationError(
+        f"{context} must be a string or absent, "
+        f"got {type(value).__name__}{named}: {value!r}"
+    )

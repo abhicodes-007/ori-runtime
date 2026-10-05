@@ -6631,3 +6631,46 @@ def test_hardened_posture_needs_an_operator_for_either_approval_channel(channel)
             database_path="ori_state.db",
             config_signature_verified=True,
         )
+
+
+def test_skill_version_rejects_non_string(tmp_path):
+    """skills[].version must be a string or absent — not str() of a mapping."""
+    path = _write_yaml(
+        tmp_path,
+        """
+        device:
+          id: dev-1
+          name: Lab Node
+          location: lab
+        sensors: []
+        skills:
+          - name: trip-relay
+            version: {actions: [trip_relay]}
+        """,
+    )
+    with pytest.raises(ConfigValidationError) as exc:
+        Config.load(path)
+    msg = str(exc.value)
+    assert "version" in msg
+    assert "trip-relay" in msg
+
+
+def test_skill_version_accepts_string_and_absent(tmp_path):
+    path = _write_yaml(
+        tmp_path,
+        """
+        device:
+          id: dev-1
+          name: Lab Node
+          location: lab
+        sensors: []
+        skills:
+          - name: trip-relay
+            version: "1.2.3"
+          - name: other
+        """,
+    )
+    cfg = Config.load(path)
+    by_name = {s.name: s for s in cfg.skills}
+    assert by_name["trip-relay"].version == "1.2.3"
+    assert by_name["other"].version == ""
