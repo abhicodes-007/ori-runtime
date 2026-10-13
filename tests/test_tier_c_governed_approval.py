@@ -961,7 +961,7 @@ class TestRelayPolicyIsDecidedByClass:
             )
             assert rows == [], (action, rows)
             assert operator.proposals == [], (action, operator.proposals)
-            assert outcome.approved is not True, (action, outcome)
+            assert outcome.approved is None, (action, outcome)
             # Dispatch itself suppressed it and wrote that audit, so the
             # action never reached the proposal path at all.
             assert any(
@@ -1468,7 +1468,7 @@ class TestAJoinedContributorReportsTheProposedAct:
 
         assert joiner.action_taken == "coalesced"
         assert joiner.executed is False and joiner.approved is None, joiner
-        assert joiner.proposal_id in ("", None), joiner
+        assert joiner.proposal_id is None, joiner
         approved = reply == "YES"
         assert journal.count("act:trip_relay") == (1 if approved else 0), journal
         executed_proposed = [
@@ -1488,7 +1488,7 @@ class TestAJoinedContributorReportsTheProposedAct:
             # The safe default ran and is the holder's record; nothing records
             # the proposed act as executed.
             assert "act:log_to_dashboard" in journal, journal
-            assert holder.approved is not True and holder.safe_default_used is True
+            assert holder.approved is False and holder.safe_default_used is True
             assert executed_proposed == [], rows
 
     async def test_an_uncertain_command_settles_on_the_proposed_act(self) -> None:

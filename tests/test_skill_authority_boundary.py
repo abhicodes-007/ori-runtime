@@ -283,9 +283,19 @@ class TestRegistryShape:
                 )
 
     def test_registry_only_raises_tiers(self):
-        for name in ACTION_REGISTRY:
+        # Spelled out here, not taken from the registry under test.
+        rank = {"A": 1, "B": 2, "C": 3, "D": 4}
+        for name, entry in ACTION_REGISTRY.items():
+            floor = entry.minimum_tier
             for tier in ("A", "B", "C", "D"):
-                assert enforce_minimum_tier(name, tier) in (tier, "B", "C", "D")
+                got = enforce_minimum_tier(name, tier)
+                assert rank[got] >= rank[tier], (name, tier, got)
+                assert got == max(tier, floor, key=rank.__getitem__), (
+                    name,
+                    tier,
+                    floor,
+                    got,
+                )
 
     def test_tier_d_declaration_is_never_lowered(self):
         """A skill may raise a relay action to Tier D; the floor must not undo it."""
@@ -396,15 +406,16 @@ actions:
         )
 
         assert ran is False, "a relay fired without passing the approval workflow"
-        assert result.action_name != "trip_relay" or result.executed is False
+        assert result.action_name == result.action_taken == "log_to_dashboard"
 
-    async def test_understated_relay_reaches_approval_when_relay_is_enabled(self):
-        """With the relay wired, the raised tier lands in the approval workflow.
+    async def test_understated_relay_is_raised_and_refused_when_relay_is_enabled(self):
+        """With the relay wired, the raised Tier C action is refused uncommissioned.
 
         The previous test exercises the path where DevicePolicy suppresses the
         relay outright. This one removes that second line of defence so the
         registry escalation is the only thing standing between a Tier A
-        declaration and a physical actuation.
+        declaration and a physical actuation. With no commissioned zone the
+        action is refused before any operator is asked.
         """
         dispatcher = ActionDispatcher(config={"relay_enabled": True})
         ran = False
@@ -425,7 +436,8 @@ actions:
         )
 
         assert ran is False, "a relay fired without operator approval"
-        assert result.approved is not True
+        assert result.approved is None
+        assert result.action_taken == "refused_uncommissioned"
         assert result.tier == ActionTier.HARD_PHYSICAL
 
     async def test_execute_immediately_refuses_below_the_floor(self):
@@ -1361,7 +1373,7 @@ class TestSafeDefaultsCannotActuate:
         )
 
         assert fired == [], f"a relay fired as a safe default: {fired}"
-        assert result.approved is not True
+        assert result.approved is False
 
 
 # ─── Authoritative sensor fields ──────────────────────────────────────────────
