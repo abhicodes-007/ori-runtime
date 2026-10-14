@@ -192,15 +192,21 @@ class MqttGatewayHeartbeatSubscriber:
                 logger.warning("[gateway-heartbeat] rejected heartbeat: %s", exc)
                 return
 
-        # Extract timestamp; fall back to local clock so posture is never
-        # blocked by a malformed field.
+        # Freshness is the receive time: a gateway's own clock, ahead by any
+        # amount, would otherwise hold it reachable after it stopped. Its
+        # timestamp is logged and decides nothing.
+        received_at_ms = now_ms()
         raw_ts = payload.get("timestamp_ms")
         try:
             timestamp_ms = int(raw_ts) if raw_ts is not None else now_ms()
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
+            # OverflowError: Infinity parses as a JSON number and int() refuses it.
             timestamp_ms = now_ms()
 
-        status = str(payload.get("status", "") or "")
+        # Taken only as text: str() of a value nested past the recursion
+        # limit raises on paho's thread.
+        raw_status = payload.get("status")
+        status = raw_status if isinstance(raw_status, str) else ""
         if status and status not in _VALID_STATUSES:
             logger.debug(
                 "[gateway-heartbeat] unrecognised status %r; heartbeat still recorded",
@@ -214,7 +220,7 @@ class MqttGatewayHeartbeatSubscriber:
         # call_soon_threadsafe is required: _on_message fires on paho's network
         # thread; record_gateway_heartbeat must run on the asyncio event loop.
         loop.call_soon_threadsafe(
-            self._posture_tracker.record_gateway_heartbeat, timestamp_ms
+            self._posture_tracker.record_gateway_heartbeat, received_at_ms
         )
 
 

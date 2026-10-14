@@ -293,6 +293,16 @@ REVIEWED_OPERATOR_MESSAGES = frozenset(
         "[confirmation] reconciliation cycle failed",
         "[confirmation] pending obligations fill the %d-row window; "
         "devices beyond it wait for earlier ones to resolve",
+        # Reviewed: an artifact type from the closed inbound set, a fixed
+        # stage phrase, and a sanitised failure category. No path, identity,
+        # key, digest or exception text.
+        "[evidence] the store failed while %s a %s (%s); nothing was decided from it",
+        "[evidence] the refusal of a %s could not be recorded (%s)",
+        "[evidence] rollback failed (%s)",
+        # Reviewed: a sanitised category and this device's own behaviour.
+        "[evidence] a failed connection did not close (%s)",
+        "[evidence] the store could not be reopened (%s); the next use retries",
+        "[evidence] a transaction was left open; reopening",
     }
 )
 
@@ -481,6 +491,8 @@ EVIDENCE_HEALTH_KEYS = {
     "status_counts",
     "ingest_refusal_count",
     "last_ingest_refusal",
+    # runtime-health/v4's application-storage fault signal, carried in v3.
+    "application_storage_fault",
     "posture_problems",
     # runtime-health/v3: the Tier C action-outcome records, None until the
     # dispatcher exists.

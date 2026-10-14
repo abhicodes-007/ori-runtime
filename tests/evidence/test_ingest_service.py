@@ -335,8 +335,8 @@ def test_a_range_digest_in_descending_order_is_refused(rig):
     )
 
 
-def test_an_unreadable_sealed_chain_row_digest_refuses_rather_than_raises(rig):
-    """A damaged stored digest cannot be checked, so nothing is applied."""
+def test_an_unreadable_sealed_chain_row_digest_is_a_store_fault(rig):
+    """A damaged stored digest is the store failing: undecided, never retired."""
     _, chain, ledger, service = rig
     for n in (1, 2):
         _seal(chain, ledger, n)
@@ -348,7 +348,13 @@ def test_an_unreadable_sealed_chain_row_digest_refuses_rather_than_raises(rig):
     )
 
     outcome = service.accept_receipt(artifact)
-    assert outcome.reason == REJECT_BINDING_MISMATCH
+    assert (outcome.state, outcome.reason, outcome.decided) == (
+        "undecided",
+        None,
+        False,
+    )
+    assert service.application_storage_fault is True
+    assert service.rejections == ()
     assert [r["local_seq"] for r in ledger.undelivered()] == [1, 2]
 
 
@@ -744,26 +750,24 @@ def test_replaying_the_same_receipt_is_idempotent(rig):
     assert before == after
 
 
-def test_a_conflicting_receipt_over_the_same_range_is_rejected(rig):
-    """Two authorities cannot both be right about one range.
+def test_a_receipt_restating_a_receipted_range_agrees_on_coverage(rig):
+    """A later receipt over a held sequence never rewrites it and is never refused.
 
-    The final-state triggers refuse a rewrite, so a second receipt claiming a
-    different acceptance time or key for an already-delivered range cannot
-    quietly replace what the first one established.
+    The first receipt's time and key stand; the restating receipt applies only
+    sequences not yet receipted, here none.
     """
-    import sqlite3
-
     _, chain, ledger, service = rig
     _seal(chain, ledger, 1)
     assert service.accept_receipt(_receipt(ledger, 1, 1)).accepted
 
-    conflicting = _receipt(ledger, 1, 1)
-    conflicting["accepted_at_ms"] = 1787000009999
-    _sign(conflicting, RECEIPT_DOMAIN, RECEIPT_SEED)
+    later = _receipt(ledger, 1, 1)
+    later["accepted_at_ms"] = 1787000009999
+    _sign(later, RECEIPT_DOMAIN, RECEIPT_SEED)
 
-    with pytest.raises(sqlite3.IntegrityError, match="receipt"):
-        service.accept_receipt(conflicting)
+    outcome = service.accept_receipt(later)
+    assert outcome.accepted and outcome.applied_sequences == ()
     assert ledger.find_by_local_seq(1)["receipt_at_ms"] == 1787000001000
+    assert service.rejections == ()
 
 
 def test_replaying_custody_is_idempotent(rig):
@@ -942,3 +946,389 @@ def test_rejections_are_retained_for_diagnosis(rig):
         "custody_acknowledgement",
     ]
     assert all(r.reason for r in service.rejections)
+
+
+# --------------------------------------------------------------------------
+# evidence-exchange/v3: earlier epochs, restatements and store faults
+# --------------------------------------------------------------------------
+
+EARLIER_SEED = bytes([0x4D] * 32)
+
+
+def _seal_earlier_registration(ledger, pubkey_hex: str) -> None:
+    ledger.seal_registration(
+        {
+            "v": 1,
+            "device_id": DEVICE,
+            "pubkey_hex": pubkey_hex,
+            "anchor_epoch_id": EARLIER_EPOCH,
+            "commissioning_digest": "sha256:" + "a" * 64,
+        },
+        sealed_at_ms=1787000000500,
+    )
+
+
+def _earlier_confirmation(pubkey_hex: str, *, confirmed_at_ms=1787000000700):
+    artifact = _confirmation(pubkey_hex)
+    artifact["anchor_epoch_id"] = EARLIER_EPOCH
+    artifact["confirmed_at_ms"] = confirmed_at_ms
+    return _sign(artifact, EPOCH_DOMAIN, EPOCH_SEED)
+
+
+def test_an_earlier_epoch_sealed_under_an_earlier_key_is_confirmed(rig):
+    """The key is checked against the registration sealed for that epoch."""
+    key, _, ledger, service = rig
+    earlier_key = _pub(EARLIER_SEED)
+    _register(ledger, key)
+    _seal_earlier_registration(ledger, earlier_key)
+    assert service.accept_epoch_confirmation(_confirmation(key.public_key_hex)).accepted
+
+    outcome = service.accept_epoch_confirmation(_earlier_confirmation(earlier_key))
+
+    assert outcome.accepted, outcome
+    assert ledger.registration_confirmed(EARLIER_EPOCH, earlier_key)
+    assert ConfirmedEpochReader(ledger).active_anchor_epoch_id(DEVICE) == EPOCH
+
+
+def test_an_earlier_epoch_named_under_a_key_it_was_not_sealed_under_is_refused(rig):
+    key, _, ledger, service = rig
+    _seal_earlier_registration(ledger, _pub(EARLIER_SEED))
+
+    outcome = service.accept_epoch_confirmation(
+        _earlier_confirmation(key.public_key_hex)
+    )
+
+    assert outcome.reason == REJECT_BINDING_MISMATCH
+    assert not ledger.registration_confirmed(EARLIER_EPOCH, key.public_key_hex)
+
+
+def test_a_conflicting_confirmation_moves_neither_record_nor_projection(rig):
+    key, _, ledger, service = rig
+    _register(ledger, key)
+    assert service.accept_epoch_confirmation(_confirmation(key.public_key_hex)).accepted
+    projection = dict(ledger.confirmed_epoch(DEVICE))
+
+    later = _confirmation(key.public_key_hex)
+    later["confirmed_at_ms"] += 1
+    _sign(later, EPOCH_DOMAIN, EPOCH_SEED)
+    outcome = service.accept_epoch_confirmation(later)
+
+    assert outcome.reason == "restatement_conflict"
+    assert dict(ledger.confirmed_epoch(DEVICE)) == projection
+
+
+def test_an_unreadable_sealed_registration_key_is_a_store_fault(rig):
+    """A damaged key matches nothing, and "never sealed" would retire the answer."""
+    key, _, ledger, service = rig
+    _register(ledger, key)
+    ledger._connection.execute("DROP TRIGGER evidence_registration_obligation_sealed")
+    ledger._connection.execute(
+        "UPDATE evidence_registration_obligation SET pubkey_hex = 'damaged'"
+    )
+
+    outcome = service.accept_epoch_confirmation(_confirmation(key.public_key_hex))
+
+    assert outcome.state == "undecided" and outcome.reason is None
+    assert service.application_storage_fault is True
+    assert service.rejections == ()
+
+
+def _disposition_service(service, triggering: str):
+    from ori.security.evidence.disposition import (
+        DispositionScope,
+        DispositionValue,
+        VerifiedDisposition,
+    )
+
+    class _Verifier:
+        def verify_disposition(self, artifact: object) -> VerifiedDisposition:
+            return VerifiedDisposition(
+                digest="sha256:" + "d" * 64,
+                triggering_digest=triggering,
+                device_id=DEVICE,
+                anchor_epoch_id="",
+                scope=DispositionScope.ARTIFACT,
+                value=DispositionValue.ARTIFACT_TERMINAL,
+                decided_at_ms=1787000003000,
+                key_id="sha256:" + "e" * 64,
+            )
+
+    service._disposition_verifier = _Verifier()
+    return service
+
+
+@pytest.mark.parametrize(
+    "stored",
+    [
+        "{not json",
+        "[]",
+        json.dumps({"anchor_epoch_id": EPOCH}),
+        json.dumps({"device_id": 7, "anchor_epoch_id": EPOCH}),
+        json.dumps({"device_id": DEVICE}),
+        json.dumps({"device_id": DEVICE, "anchor_epoch_id": 7}),
+    ],
+    ids=[
+        "not-json",
+        "not-an-object",
+        "no-device",
+        "device-not-text",
+        "no-epoch",
+        "epoch-not-text",
+    ],
+)
+def test_an_unreadable_sealed_artifact_leaves_a_disposition_undecided(rig, stored):
+    """A sealed copy that cannot be read is not an artifact never sealed, nor
+    another identity's: either answer would retire a valid disposition."""
+    _, _, ledger, service = rig
+    triggering = "sha256:" + "c" * 64
+    ledger._connection.execute(
+        "INSERT INTO evidence_outbox"
+        " (artifact_type, artifact_json, artifact_digest, created_at_ms)"
+        " VALUES ('checkpoint', ?, ?, 1)",
+        (stored, triggering),
+    )
+
+    outcome = _disposition_service(service, triggering).accept_disposition({"o": 1})
+
+    assert outcome.state == "undecided" and outcome.reason is None
+    assert ledger.last_disposition() is None
+
+
+@pytest.mark.parametrize("column", ["device_id", "anchor_epoch_id"])
+def test_an_envelope_whose_binding_is_not_text_leaves_a_disposition_undecided(
+    rig, column
+):
+    """Read as text it would be "None" or a byte string: another device or epoch."""
+    _, chain, ledger, service = rig
+    _seal(chain, ledger, 1)
+    envelope_digest = str(ledger.find_by_local_seq(1)["envelope_digest"])
+    ledger._connection.execute("DROP TRIGGER evidence_ledger_no_sealed_update")
+    ledger._connection.execute(
+        f"UPDATE evidence_delivery_ledger SET {column} = x'00' WHERE local_seq = 1"
+    )
+
+    outcome = _disposition_service(service, envelope_digest).accept_disposition({})
+
+    assert outcome.state == "undecided" and outcome.reason is None
+    assert ledger.last_disposition() is None
+
+
+def test_a_sealed_artifact_whose_type_is_not_text_leaves_a_disposition_undecided(
+    rig,
+):
+    _, _, ledger, service = rig
+    triggering = "sha256:" + "c" * 64
+    ledger._connection.execute("PRAGMA ignore_check_constraints=ON")
+    ledger._connection.execute(
+        "INSERT INTO evidence_outbox"
+        " (artifact_type, artifact_json, artifact_digest, created_at_ms)"
+        " VALUES (x'00', ?, ?, 1)",
+        (json.dumps({"device_id": DEVICE, "anchor_epoch_id": EPOCH}), triggering),
+    )
+    ledger._connection.execute("PRAGMA ignore_check_constraints=OFF")
+
+    outcome = _disposition_service(service, triggering).accept_disposition({})
+
+    assert outcome.state == "undecided" and outcome.reason is None
+    assert ledger.last_disposition() is None
+
+
+def test_the_health_summary_reads_a_reason_outside_the_vocabulary_as_a_fault(tmp_path):
+    """Both refusal readers apply one rule: health never publishes such a reason."""
+    import asyncio
+
+    from ori.security.evidence.first_party import FirstPartyEvidenceAttestor
+
+    attestor = FirstPartyEvidenceAttestor(
+        db_path=str(tmp_path / "evidence.db"),
+        key_path=str(tmp_path / "evidence.key"),
+        device_secret="install-secret",
+        device_id=DEVICE,
+    )
+    try:
+        assert asyncio.run(attestor.start())
+        ledger = attestor._ledger
+        assert ledger is not None
+        attestor._executor.run(
+            lambda: ledger.record_ingest_refusal(
+                artifact_type="delivery_receipt",
+                reason="not_a_reason",
+                detail="",
+                observed_at_ms=1,
+            )
+        )
+        assert asyncio.run(attestor.ingest_refusal_summary()) is None
+    finally:
+        attestor.close()
+
+
+def test_a_retained_refusal_outside_the_vocabulary_reads_as_a_store_fault(rig):
+    from ori.security.evidence.ledger import EvidenceStoreFaultError
+
+    _, _, ledger, service = rig
+    ledger.record_ingest_refusal(
+        artifact_type="delivery_receipt",
+        reason="not_a_contract_reason",
+        detail="",
+        observed_at_ms=1,
+    )
+    with pytest.raises(EvidenceStoreFaultError):
+        service.rejections
+
+
+@pytest.mark.parametrize(
+    "column, value",
+    [
+        ("chain_row_digest", "sha256:" + "0" * 64),
+        ("envelope_digest", "sha256:" + "0" * 64),
+        ("device_id", "another-device"),
+        ("anchor_epoch_id", "sha256:" + "9" * 64),
+    ],
+)
+def test_a_well_formed_but_wrong_sealed_column_is_a_store_fault(rig, column, value):
+    """Held to the envelope bytes the device signed, not trusted on its spelling."""
+    _, chain, ledger, service = rig
+    for n in (1, 2):
+        _seal(chain, ledger, n)
+    artifact = _receipt(ledger, 1, 2)
+    ledger._connection.execute("DROP TRIGGER evidence_ledger_no_sealed_update")
+    ledger._connection.execute(
+        f"UPDATE evidence_delivery_ledger SET {column} = ? WHERE local_seq = 2",
+        (value,),
+    )
+
+    outcome = service.accept_receipt(artifact)
+
+    assert (outcome.state, outcome.reason) == ("undecided", None)
+    assert service.application_storage_fault is True
+    assert [r["local_seq"] for r in ledger.undelivered()] == [1, 2]
+
+
+def test_a_damaged_obligation_state_leaves_a_registration_disposition_undecided(rig):
+    """Read as "not open" it would refuse the disposition superseded, retiring it."""
+    from ori.security.evidence.disposition import (
+        DispositionScope,
+        DispositionValue,
+        VerifiedDisposition,
+    )
+
+    key, _, ledger, service = rig
+    _register(ledger, key)
+    obligation = ledger.open_registration_obligation(EPOCH)
+    digest = str(obligation["artifact_digest"])
+    ledger._connection.execute(
+        "DROP TRIGGER evidence_registration_obligation_closed_is_final"
+    )
+    ledger._connection.execute("PRAGMA ignore_check_constraints=ON")
+    ledger._connection.execute(
+        "UPDATE evidence_registration_obligation SET state = 'broken'"
+    )
+    ledger._connection.execute("PRAGMA ignore_check_constraints=OFF")
+
+    class _Verifier:
+        def verify_disposition(self, artifact: object) -> VerifiedDisposition:
+            return VerifiedDisposition(
+                digest="sha256:" + "d" * 64,
+                triggering_digest=digest,
+                device_id=DEVICE,
+                anchor_epoch_id=EPOCH,
+                scope=DispositionScope.ARTIFACT,
+                value=DispositionValue.ARTIFACT_TERMINAL,
+                decided_at_ms=1787000003000,
+                key_id="sha256:" + "e" * 64,
+            )
+
+    service._disposition_verifier = _Verifier()
+    outcome = service.accept_disposition({})
+
+    assert (outcome.state, outcome.reason) == ("undecided", None)
+    assert ledger.last_disposition() is None
+
+
+@pytest.mark.parametrize(
+    "damage, value",
+    [
+        (
+            "UPDATE evidence_outbox SET artifact_type = 'checkpoint'"
+            " WHERE artifact_type = 'anchor_registration'",
+            "artifact_terminal",
+        ),
+        (
+            "UPDATE evidence_registration_obligation SET suspended_at_ms = 'garbage'",
+            "retained_pending",
+        ),
+    ],
+    ids=["registration-read-as-checkpoint", "unreadable-suspension"],
+)
+def test_a_damaged_registration_leaves_its_disposition_undecided(rig, damage, value):
+    """Applied, it would close nothing or suspend nothing while answering applied."""
+    from ori.security.evidence.disposition import (
+        DispositionScope,
+        DispositionValue,
+        VerifiedDisposition,
+    )
+
+    key, _, ledger, service = rig
+    _register(ledger, key)
+    digest = str(ledger.open_registration_obligation(EPOCH)["artifact_digest"])
+    for trigger in (
+        "evidence_outbox_no_artifact_update",
+        "evidence_registration_obligation_suspension_is_final",
+    ):
+        ledger._connection.execute(f"DROP TRIGGER {trigger}")
+    ledger._connection.execute(damage)
+
+    class _Verifier:
+        def verify_disposition(self, artifact: object) -> VerifiedDisposition:
+            return VerifiedDisposition(
+                digest="sha256:" + "d" * 64,
+                triggering_digest=digest,
+                device_id=DEVICE,
+                anchor_epoch_id=EPOCH,
+                scope=DispositionScope.ARTIFACT,
+                value=DispositionValue(value),
+                decided_at_ms=1787000003000,
+                key_id="sha256:" + "e" * 64,
+            )
+
+    service._disposition_verifier = _Verifier()
+    outcome = service.accept_disposition({})
+
+    assert (outcome.state, outcome.reason) == ("undecided", None)
+    assert ledger.last_disposition() is None
+
+
+def test_a_registration_copy_without_its_obligation_is_a_store_fault(rig):
+    """Every registration copy is sealed with its obligation; one alone is damage."""
+    from ori.security.evidence.disposition import (
+        DispositionScope,
+        DispositionValue,
+        VerifiedDisposition,
+    )
+
+    _, _, ledger, service = rig
+    triggering = "sha256:" + "c" * 64
+    ledger._connection.execute(
+        "INSERT INTO evidence_outbox"
+        " (artifact_type, artifact_json, artifact_digest, created_at_ms)"
+        " VALUES ('anchor_registration', ?, ?, 1)",
+        (json.dumps({"device_id": DEVICE, "anchor_epoch_id": EPOCH}), triggering),
+    )
+
+    class _Verifier:
+        def verify_disposition(self, artifact: object) -> VerifiedDisposition:
+            return VerifiedDisposition(
+                digest="sha256:" + "d" * 64,
+                triggering_digest=triggering,
+                device_id=DEVICE,
+                anchor_epoch_id=EPOCH,
+                scope=DispositionScope.ARTIFACT,
+                value=DispositionValue.ARTIFACT_TERMINAL,
+                decided_at_ms=1787000003000,
+                key_id="sha256:" + "e" * 64,
+            )
+
+    service._disposition_verifier = _Verifier()
+    outcome = service.accept_disposition({})
+
+    assert (outcome.state, outcome.reason) == ("undecided", None)

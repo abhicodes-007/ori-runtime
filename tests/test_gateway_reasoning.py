@@ -99,6 +99,7 @@ async def test_mqtt_gateway_reasoner_publishes_contract_payload():
     fake = _FakeClient(
         response_builder=lambda req: {
             "request_id": req["request_id"],
+            "device_id": req["device_id"],
             "text": "Gateway analysis completed.",
             "model": "llama-gateway",
             "tokens_used": 42,
@@ -163,6 +164,7 @@ async def test_mqtt_gateway_reasoner_applies_tls_for_mqtts_url():
     fake = _FakeClient(
         response_builder=lambda req: {
             "request_id": req["request_id"],
+            "device_id": req["device_id"],
             "text": "Gateway TLS analysis completed.",
             "model": "llama-gateway",
             "tokens_used": 10,
@@ -190,6 +192,7 @@ async def test_mqtt_gateway_reasoner_raises_on_gateway_error():
     fake = _FakeClient(
         response_builder=lambda req: {
             "request_id": req["request_id"],
+            "device_id": req["device_id"],
             "text": "",
             "model": "gateway",
             "tokens_used": 0,
@@ -216,6 +219,7 @@ async def test_mqtt_gateway_reasoner_rejects_invalid_response_action_tier():
     fake = _FakeClient(
         response_builder=lambda req: {
             "request_id": req["request_id"],
+            "device_id": req["device_id"],
             "text": "Gateway response with invalid tier.",
             "model": "gateway",
             "tokens_used": 10,
@@ -356,3 +360,139 @@ def test_mqtt_gateway_reasoner_fails_lazily_when_paho_missing(monkeypatch):
             device_id="site-a",
             client_factory=lambda **_: _FakeClient(),
         )
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("tokens_used", float("nan")),
+        ("tokens_used", float("inf")),
+        ("latency_ms", float("-inf")),
+        ("tokens_used", "many"),
+        ("latency_ms", [1]),
+        ("confidence", float("nan")),
+        ("confidence", float("inf")),
+        ("confidence", "sure"),
+        ("confidence", True),
+        ("tokens_used", 3.9),
+        ("tokens_used", "12"),
+        ("tokens_used", -7),
+        ("tokens_used", True),
+        ("latency_ms", 1e300),
+        ("text", {"a": 1}),
+        ("model", 7),
+        ("proposed_action", 3),
+        ("error", {"a": 1}),
+        *[
+            (field, value)
+            for field in ("error", "model")
+            for value in (False, 0, 0.0, [], {}, None)
+        ],
+        ("confidence", 10**400),
+        ("confidence", -(10**400)),
+    ],
+)
+async def test_a_response_field_with_no_value_is_the_gateways_error(field, value):
+    """Refused at parse as GatewayReasoningError, never left to a caller's fallback."""
+    response = {
+        "text": "Gateway response.",
+        "model": "gateway",
+        "tokens_used": 10,
+        "latency_ms": 50,
+        "confidence": 0.5,
+        "action_tier": "A",
+        "proposed_action": None,
+    }
+    response[field] = value
+    fake = _FakeClient(
+        response_builder=lambda req: {
+            "request_id": req["request_id"],
+            "device_id": req["device_id"],
+            **response,
+        }
+    )
+    reasoner = MqttGatewayReasoner(
+        broker_url="mqtt://broker.local",
+        device_id="site-a",
+        timeout_ms=1000,
+        client_factory=lambda **_: fake,
+        request_id_factory=lambda: "req-bad-field",
+    )
+
+    with pytest.raises(
+        GatewayReasoningError, match="malformed|not finite|invalid|not text"
+    ):
+        await reasoner.reason("Prompt", event=_event(), rule_result=_rule("A"))
+
+
+@pytest.mark.parametrize("device_id", ["other-device", [], None])
+async def test_an_unauthenticated_response_naming_another_device_is_refused(device_id):
+    """The body, the topic and the request name one device, per gateway-api/v2."""
+    response = {
+        "request_id": "req-device",
+        "text": "Gateway response.",
+        "model": "gateway",
+        "tokens_used": 10,
+        "latency_ms": 50,
+        "confidence": 0.5,
+        "action_tier": "A",
+        "proposed_action": None,
+    }
+    if device_id is not None:
+        response["device_id"] = device_id
+    fake = _FakeClient(response_builder=lambda req: response)
+    reasoner = MqttGatewayReasoner(
+        broker_url="mqtt://broker.local",
+        device_id="site-a",
+        timeout_ms=1000,
+        client_factory=lambda **_: fake,
+        request_id_factory=lambda: "req-device",
+    )
+
+    with pytest.raises(GatewayReasoningError, match="another device"):
+        await reasoner.reason("Prompt", event=_event(), rule_result=_rule("A"))
+
+
+@pytest.mark.parametrize(
+    "change, model",
+    [
+        ({"error": ""}, "gateway-model"),
+        ({"model": ""}, "gateway"),
+        ({"model": None, "drop": "model"}, "gateway"),
+        ({"confidence": 10**300}, "gateway-model"),
+    ],
+)
+async def test_a_conforming_response_field_is_accepted(change, model):
+    """An empty error, and an empty or omitted model, are within the contract."""
+    response = {
+        "text": "Gateway response.",
+        "model": "gateway-model",
+        "tokens_used": 10,
+        "latency_ms": 50,
+        "confidence": 0.5,
+        "action_tier": "A",
+        "proposed_action": None,
+    }
+    change = dict(change)
+    dropped = change.pop("drop", None)
+    response.update(change)
+    if dropped is not None:
+        del response[dropped]
+    fake = _FakeClient(
+        response_builder=lambda req: {
+            "request_id": req["request_id"],
+            "device_id": req["device_id"],
+            **response,
+        }
+    )
+    reasoner = MqttGatewayReasoner(
+        broker_url="mqtt://broker.local",
+        device_id="site-a",
+        timeout_ms=1000,
+        client_factory=lambda **_: fake,
+        request_id_factory=lambda: "req-good-field",
+    )
+
+    result = await reasoner.reason("Prompt", event=_event(), rule_result=_rule("A"))
+
+    assert result.model == model

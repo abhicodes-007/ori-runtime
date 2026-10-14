@@ -38,6 +38,7 @@ from ori.security.evidence.authority_keys import (
     PURPOSE_RECEIPT,
     STATUS_ACTIVE,
     AuthorityKey,
+    derive_key_id,
 )
 from ori.security.evidence.canonical import canonical_json
 from ori.security.evidence.first_party import FirstPartyEvidenceAttestor
@@ -58,14 +59,17 @@ REFERENCE = "sha256:" + "ab" * 32
 OTHER_REFERENCE = "sha256:" + "cd" * 32
 EPOCH_SEED = bytes(range(32, 64))
 RECEIPT_SEED = bytes(range(64, 96))
-EPOCH_KEY_ID = "authority-epoch-1"
-RECEIPT_KEY_ID = "authority-receipt-1"
 
 
 def _pub(seed: bytes) -> str:
     return (
         Ed25519PrivateKey.from_private_bytes(seed).public_key().public_bytes_raw().hex()
     )
+
+
+# Derived as the registry loader derives them, the only shape a release holds.
+EPOCH_KEY_ID = derive_key_id(bytes.fromhex(_pub(EPOCH_SEED)))
+RECEIPT_KEY_ID = derive_key_id(bytes.fromhex(_pub(RECEIPT_SEED)))
 
 
 def _registry() -> dict[tuple[str, str], AuthorityKey]:
@@ -828,6 +832,37 @@ async def test_an_active_epoch_recorded_without_a_registration_is_not_confirmed(
     assert await attestor.reconcile_registration(REFERENCE) is (
         RegistrationStatus.PENDING_CONFIRMATION
     )
+
+
+async def test_a_projection_an_earlier_release_wrote_does_not_block_confirmation(
+    device,
+):
+    """A store upgraded from a release that projected confirmations with
+    nothing sealed: the registration sealed now is still confirmable."""
+    attestor = device.attestor
+    conn = sqlite3.connect(str(device.root / "evidence.db"))
+    try:
+        conn.execute(
+            "INSERT INTO evidence_device_epochs VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                DEVICE,
+                attestor.anchor.anchor_epoch_id,
+                attestor.public_key_hex,
+                "someone",
+                1,
+                EPOCH_KEY_ID,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    await attestor.reconcile_registration(REFERENCE)
+
+    outcome = attestor.ingest.accept_epoch_confirmation(_confirmation(attestor))
+
+    assert outcome.accepted, outcome
+    assert device.obligations()[-1]["state"] == "confirmed"
+    assert attestor.application_storage_fault is False
 
 
 async def test_a_confirmation_for_the_current_epoch_with_nothing_sealed_is_refused(
