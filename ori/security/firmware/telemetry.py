@@ -53,6 +53,11 @@ from dataclasses import dataclass, field
 from typing import Any, Mapping
 
 from ori.security.ed25519_keys import admit_public_key, refused_public_key_clause
+from ori.security.firmware.signing_domains import (
+    RUNTIME_KEY_DOMAINS_FIELD,
+    RUNTIME_KEY_DOMAINS_VALUE,
+    declares_signing_domains,
+)
 
 __all__ = [
     "ALARM_WORD_SENSOR_TYPE",
@@ -82,7 +87,7 @@ PRODUCTION_POSTURES = ("sealed_flash", "hardware_key")
 DEVICE_MODES = frozenset({"sensor_node", "bridge_node", "actuator_node", "mixed"})
 # Names the rules validate_manifest_policy applies, so a stored anchor is
 # re-checked when they change rather than once for all time.
-MANIFEST_POLICY_REVISION = "firmware-telemetry/v2 controller-profiles"
+MANIFEST_POLICY_REVISION = "firmware-telemetry/v2 runtime-key-domains"
 SUPPORTED_TRANSPORTS = frozenset({"mqtt", "uart", "rs485"})
 SUPPORTED_CHANNEL_PROTOCOLS = frozenset(
     {"adc", "gpio", "i2c", "uart", "modbus_rtu", "rs232", "pulse", "one_wire"}
@@ -108,7 +113,9 @@ MANIFEST_REQUIRED_FIELDS = frozenset(
         "interlocks",
     }
 )
-MANIFEST_OPTIONAL_FIELDS = frozenset({"deployment_maintenance_limit_ms"})
+MANIFEST_OPTIONAL_FIELDS = frozenset(
+    {"deployment_maintenance_limit_ms", RUNTIME_KEY_DOMAINS_FIELD}
+)
 _ACTION_FIELDS = frozenset({"action", "channel", "authority"})
 _INTERLOCK_FIELDS = frozenset({"name", "channel", "action"})
 
@@ -132,6 +139,7 @@ ERR_INVALID_READING = "invalid_reading"
 ERR_INVALID_ENVELOPE = "invalid_envelope"
 ERR_INVALID_DEVICE_MODE = "invalid_device_mode"
 ERR_NO_CHANNELS = "no_channels"
+ERR_INVALID_RUNTIME_KEY_DOMAINS = "invalid_runtime_key_domains"
 ERR_UNSUPPORTED_ALG = "unsupported_alg"
 ERR_DEVICE_REVOKED = "device_revoked"
 ERR_DEVICE_NOT_APPROVED = "device_not_approved"
@@ -768,6 +776,18 @@ def _validate_manifest_fields(manifest: dict[str, Any]) -> None:
                 ERR_INVALID_ENVELOPE,
                 "deployment_maintenance_limit_ms must be a positive integer",
             )
+    _validate_runtime_key_domains(manifest)
+
+
+def _validate_runtime_key_domains(manifest: dict[str, Any]) -> None:
+    # Compared whole: never by prefix, length, NUL, trimming, case or
+    # normalization, any of which would admit a value the contract defines
+    # nothing for. Applied to fresh and stored manifests alike.
+    if RUNTIME_KEY_DOMAINS_FIELD in manifest and not declares_signing_domains(manifest):
+        raise FirmwareVerificationError(
+            ERR_INVALID_RUNTIME_KEY_DOMAINS,
+            f"{RUNTIME_KEY_DOMAINS_FIELD} must be the string {RUNTIME_KEY_DOMAINS_VALUE!r}",
+        )
 
 
 def derive_device_mode(
@@ -818,6 +838,7 @@ def validate_manifest_policy(manifest: Any) -> None:
             ERR_INVALID_ENVELOPE, "stored manifest has no actions list"
         )
     _validate_device_mode(manifest, channels)
+    _validate_runtime_key_domains(manifest)
 
 
 def _validate_device_mode(

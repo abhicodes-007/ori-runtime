@@ -47,6 +47,7 @@ from ori.security.firmware.controller_profiles import (
     measurement_in_range,
 )
 from ori.security.firmware.reading_age import ReadingAgeTracker
+from ori.security.firmware.signing_domains import declares_signing_domains
 from ori.security.firmware.telemetry import (
     ALARM_WORD_SENSOR_TYPE,
     ERR_BOOT_ROLLBACK,
@@ -73,6 +74,31 @@ from ori.security.firmware.telemetry import (
 from ori.state.store import FIRMWARE_ANCHOR_COLUMNS
 
 logger = logging.getLogger(__name__)
+
+
+def _warn_if_undeclared(device_id: str, manifest: Any, *, active: bool) -> None:
+    """Say so when an undeclared manifest is stored, or becomes the one in force.
+
+    A stored candidate changes nothing until it is promoted, so it is reported
+    as what promoting it would do; the active manifest is reported as what is.
+    """
+    if declares_signing_domains(manifest):
+        return
+    if active:
+        logger.warning(
+            "firmware device %r: the active manifest does not declare "
+            "runtime_key_domains; no command or liveness is signed for it and its "
+            "runtime_commanded actions are unavailable",
+            device_id,
+        )
+    else:
+        logger.warning(
+            "firmware device %r: a candidate manifest awaiting promotion does not "
+            "declare runtime_key_domains; once promoted, no command or liveness "
+            "is signed for it",
+            device_id,
+        )
+
 
 __all__ = ["FirmwareTelemetryGate"]
 
@@ -286,6 +312,8 @@ class FirmwareTelemetryGate:
                 "independent identity confirmation",
             )
 
+        if outcome != "unchanged":
+            _warn_if_undeclared(device_id, manifest, active=False)
         if outcome == "pending_manifest_epoch":
             logger.info(
                 "firmware device %r published a new manifest epoch; stored as a "
@@ -340,7 +368,7 @@ class FirmwareTelemetryGate:
         )
         if refusal is not None:
             raise FirmwareVerificationError(*refusal)
-        return bool(
+        promoted = bool(
             await self._store.approve_firmware_device(
                 device_id,
                 actor=actor,
@@ -348,6 +376,9 @@ class FirmwareTelemetryGate:
                 expected_anchor_epoch_id=str(pending["anchor_epoch_id"]),
             )
         )
+        if promoted:
+            _warn_if_undeclared(device_id, manifest, active=True)
+        return promoted
 
     async def revoke_device(self, device_id: str, *, actor: str, reason: str) -> bool:
         """Take an identity out of service. Attribution is mandatory."""
@@ -446,6 +477,7 @@ class FirmwareTelemetryGate:
                 "be the one rotated away from because it was compromised, so "
                 "returning to it would make rotation reversible",
             )
+        _warn_if_undeclared(device_id, manifest, active=False)
         logger.info(
             "firmware device %r re-provisioned with a new key; pending promotion",
             device_id,

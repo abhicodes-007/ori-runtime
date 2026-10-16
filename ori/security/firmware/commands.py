@@ -3,8 +3,10 @@
 
 """Runtime-side signing of inbound firmware commands.
 
-Implements the producer half of ``ori-specs/firmware-commands/v1.md``:
-one fixed byte grammar, signed with the runtime command key. The
+Implements the producer half of ``ori-specs/firmware-commands/v2.md``:
+one fixed byte grammar, signed with the runtime command key in the command
+signing domain (``ori.firmware_command.v2``, a NUL, the object bytes), and
+only for a device whose accepted manifest declares ``runtime_key_domains``. The
 device verifier accepts exactly this canonical form and nothing else,
 so this module builds the bytes directly — no JSON library, because the
 contract is the exact byte sequence, not "equivalent JSON".
@@ -26,10 +28,11 @@ refusal, and not when nothing came back. Nothing here or in the egress
 service retries. A fresh Tier D attempt under ``safety-profile/v1`` is a new
 command, and no firmware-commanded zone exists in this runtime to make one.
 
-The shared command and provisioning-approval golden vectors
-(``tests/fixtures/firmware_command_vectors.json`` and
-``tests/fixtures/firmware_provisioning_approval_vectors.json``) pin the
-runtime's signed bytes against the C verifier in the firmware project.
+The command corpus vendored from ori-specs
+(``tests/vectors/firmware_commands/command-vectors-v2.json``) and the
+provisioning-approval vectors
+(``tests/fixtures/firmware_provisioning_approval_vectors.json``) pin the
+runtime's signed bytes.
 """
 
 from __future__ import annotations
@@ -39,6 +42,10 @@ import re
 from typing import Any, cast
 
 from ori.security.ed25519_keys import refused_public_key_clause
+from ori.security.firmware.signing_domains import (
+    command_preimage,
+    declares_signing_domains,
+)
 
 __all__ = [
     "FirmwareCommandSigner",
@@ -155,6 +162,13 @@ def _build_approval_object_bytes(
     ).encode("utf-8")
 
 
+def _raw_public_b64(key: Any) -> str:
+    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+
+    raw = key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+    return base64.b64encode(raw).decode("ascii")
+
+
 def build_provisioning_approval_bytes(
     *,
     capability_hash: str,
@@ -185,9 +199,16 @@ def build_provisioning_approval_bytes(
         public_key_b64=public_key_b64,
         runtime_public_key_b64=runtime_public_key_b64,
     )
-    signature = Ed25519PrivateKey.from_private_bytes(
-        provisioner_private_key_bytes
-    ).sign(approval)
+    provisioner = Ed25519PrivateKey.from_private_bytes(provisioner_private_key_bytes)
+    # The runtime command key signs only the two domain preimages of
+    # firmware-commands/v2. An approval is signed over its bare bytes by the
+    # provisioning authority, so the two keys can never be one.
+    if _raw_public_b64(provisioner) == runtime_public_key_b64:
+        raise FirmwareCommandError(
+            "the provisioning authority key and the runtime command key are the "
+            "same key; they must differ"
+        )
+    signature = provisioner.sign(approval)
     sig_b64 = base64.b64encode(signature).decode("ascii")
     return (
         b'{"approval":'
@@ -238,10 +259,10 @@ class FirmwareCommandSigner:
         return self._key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
 
     def sign_command_bytes(self, command: bytes) -> bytes:
-        """Wire message for pre-built command bytes (vector/test path)."""
+        """Wire message for pre-built command bytes, signed in the command domain."""
         import base64
 
-        signature = self._key.sign(command)
+        signature = self._key.sign(command_preimage(command))
         sig_b64 = base64.b64encode(signature).decode("ascii")
         return (
             b'{"command":'
@@ -302,6 +323,15 @@ class FirmwareCommandSigner:
             raise FirmwareCommandError(
                 f"manifest does not grant runtime_commanded authority for "
                 f"({action!r}, {channel!r}) on device {device_id!r}"
+            )
+        # A device that does not declare the signing domains would refuse a
+        # command signed in them, and nothing else is ever signed: its
+        # runtime_commanded actions are unavailable, and the refusal comes
+        # before a sequence is spent.
+        if not declares_signing_domains(row.get("manifest")):
+            raise FirmwareCommandError(
+                f"device {device_id!r} does not declare runtime_key_domains; its "
+                "runtime_commanded actions are unavailable and nothing was signed"
             )
         # The allocation re-checks everything above in its own commit, so a
         # revocation, rotation or promotion that lands meanwhile stops it.

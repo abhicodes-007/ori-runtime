@@ -43,6 +43,10 @@ from ori.security.firmware.reading_age import (
     LivenessTable,
     signing_clock_ns,
 )
+from ori.security.firmware.signing_domains import (
+    declares_signing_domains,
+    liveness_preimage,
+)
 
 __all__ = [
     "FirmwareLivenessError",
@@ -104,6 +108,14 @@ assert LIVENESS_PUBLISH_INTERVAL_S <= MAX_LIVENESS_PUBLISH_INTERVAL_S, (
 
 class FirmwareLivenessError(ValueError):
     """A liveness message that must not be signed."""
+
+
+class SigningDomainsUndeclaredError(FirmwareLivenessError):
+    """The device's accepted manifest does not declare runtime_key_domains.
+
+    Unlike a lapsed supervision, the device may still be sending; it simply
+    verifies in no domain this runtime signs in, so it receives no liveness.
+    """
 
 
 @dataclass(frozen=True)
@@ -315,8 +327,8 @@ class FirmwareLivenessSigner:
         return self._key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
 
     def sign_liveness_bytes(self, liveness: bytes) -> bytes:
-        """Wire message for pre-built liveness bytes (vector/test path)."""
-        signature = self._key.sign(liveness)
+        """Wire message for pre-built liveness bytes, signed in the liveness domain."""
+        signature = self._key.sign(liveness_preimage(liveness))
         sig_b64 = base64.b64encode(signature).decode("ascii")
         return (
             b'{"liveness":'
@@ -422,6 +434,21 @@ class FirmwareLivenessSigner:
                 f"boot and manifest epoch within the supervision window"
             )
 
+    async def _require_declared(self, device_id: str) -> None:
+        # A device that does not declare the signing domains would refuse
+        # liveness signed in them, and nothing else is ever signed; refuse
+        # before a sequence is spent. The allocation that follows refuses a
+        # manifest changed in between, by its capability_hash.
+        getter = getattr(self._store, "get_firmware_device", None)
+        row = await getter(device_id) if getter is not None else None
+        if not isinstance(row, dict) or not declares_signing_domains(
+            row.get("manifest")
+        ):
+            raise SigningDomainsUndeclaredError(
+                f"{device_id}: does not declare runtime_key_domains; no liveness "
+                "is signed for it"
+            )
+
     async def sign_liveness(
         self,
         *,
@@ -436,6 +463,7 @@ class FirmwareLivenessSigner:
         self._require_supervised(
             device_id=device_id, boot_id=boot_id, capability_hash=capability_hash
         )
+        await self._require_declared(device_id)
         runtime_seq = await self._allocate(device_id, capability_hash)
         liveness = build_liveness_bytes(
             boot_id=boot_id,
