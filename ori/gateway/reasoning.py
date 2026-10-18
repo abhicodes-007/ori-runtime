@@ -28,6 +28,11 @@ from ori.security.gateway_messages import (
     GatewayMessageAuthenticator,
     GatewayMessageAuthError,
 )
+from ori.security.payload_members import (
+    REASONING_RESPONSE_MEMBERS,
+    PayloadMemberError,
+    admitted_text,
+)
 from ori.utils.time_utils import now_ms
 
 try:
@@ -235,7 +240,7 @@ class MqttGatewayReasoner:
         # Unanswered responses dropped this round trip: the first of each kind
         # is logged at once, the rest summed when it ends, so a flood across a
         # long wait writes at most two lines per kind, not one per message.
-        dropped = {"malformed": 0, "unverified": 0, "replayed": 0}
+        dropped = {"unverified": 0, "replayed": 0}
 
         def _drop(kind: str, detail: object) -> None:
             with settling:
@@ -257,13 +262,11 @@ class MqttGatewayReasoner:
             if answered.is_set():
                 # Answered already: not even decoded, authentic or not.
                 return
+            # gateway-api/v2 Payload Member Rule, before any member is read.
             try:
-                payload = json.loads(raw.decode("utf-8"))
-            except Exception:
-                _drop("malformed", "not JSON")
-                return
-            if not isinstance(payload, dict):
-                _drop("malformed", "not a JSON object")
+                payload = admitted_text(raw, defined=REASONING_RESPONSE_MEMBERS)
+            except PayloadMemberError as exc:
+                self._ingress.refuse(exc.reason)
                 return
             # Compared as it arrived: str() of a value nested past the
             # recursion limit raises on this paho thread.
