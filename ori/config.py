@@ -17,6 +17,9 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
 
+from ori.config_fields import ConfigValidationError
+from ori.config_fields import require_optional_str as _require_optional_str
+from ori.config_fields import require_str as _require_str
 from ori.hal.config_schema import (
     DocumentError,
     SchemaError,
@@ -81,10 +84,6 @@ _WHATSAPP_TEMPLATE_INTENTS = (
 # If Ori is ported to a non-Broadcom SoC, replace this with a hardware-profile
 # abstraction rather than removing startup pin validation.
 _VALID_BCM_PINS: frozenset[int] = frozenset(range(2, 28))
-
-
-class ConfigValidationError(Exception):
-    pass
 
 
 class _ConfigDocumentLimitError(Exception):
@@ -3548,28 +3547,3 @@ def _parse_logging(data: Any) -> LoggingConfig:
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
-
-
-def _require_str(data: dict, key: str, context: str) -> str:
-    value = data.get(key)
-    if value is None:
-        raise ConfigValidationError(f"'{context}.{key}' is required but missing.")
-    return str(value)
-
-
-def _require_optional_str(value: Any, context: str, *, skill_name: str = "") -> str:
-    """Return *value* when it is a string (or absent → empty string).
-
-    Non-string types are refused rather than coerced with ``str()``: a mapping
-    like ``version: {actions: [trip_relay]}`` would otherwise load as the
-    string of that mapping and look like a real version to every reader.
-    """
-    if value is None:
-        return ""
-    if isinstance(value, str):
-        return value
-    named = f" (skill {skill_name!r})" if skill_name else ""
-    raise ConfigValidationError(
-        f"{context} must be a string or absent, "
-        f"got {type(value).__name__}{named}: {value!r}"
-    )

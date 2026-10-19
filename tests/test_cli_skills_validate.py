@@ -9,8 +9,6 @@ import pytest
 
 from ori.cli import EXIT_FAILED, EXIT_OK, EXIT_UNUSABLE, main
 from ori.skills.loader import (
-    SkillValidationError,
-    SkillLoader,
     _ACTION_ALLOWED_KEYS,
     _TRIGGER_ALLOWED_KEYS,
 )
@@ -649,20 +647,18 @@ def test_single_skill_unreadable_file_json(tmp_path: Path, monkeypatch, capsys) 
     _assert_no_traceback(captured)
 
 
-def test_skill_version_rejects_non_string(tmp_path, monkeypatch):
-    """skill.yaml version must be a string or absent — not str() of a mapping."""
-    monkeypatch.setattr(
-        "ori.skills.loader.SkillLoader._is_core_bundled_skill",
-        lambda self, path: True,
-    )
-    skill_dir = tmp_path / "bad-version"
+_METADATA = {"name": "trip-relay", "version": "0.1.0", "author": "test"}
+
+
+def _write_skill_with_metadata(skill_dir: Path, field: str, value: str) -> None:
+    metadata = dict(_METADATA, **{field: value})
     skill_dir.mkdir(parents=True)
     (skill_dir / "skill.yaml").write_text(
-        textwrap.dedent(
+        f"name: {metadata['name']}\n"
+        f"version: {metadata['version']}\n"
+        f"author: {metadata['author']}\n"
+        + textwrap.dedent(
             """\
-            name: trip-relay
-            version: {actions: [trip_relay]}
-            author: test
             signature: bundled
             sensors_required:
               - type: current_clamp
@@ -681,8 +677,35 @@ def test_skill_version_rejects_non_string(tmp_path, monkeypatch):
         ),
         encoding="utf-8",
     )
-    loader = SkillLoader()
-    with pytest.raises(SkillValidationError) as exc:
-        loader.load_one(skill_dir)
-    assert "trip-relay" in str(exc.value)
-    assert "version" in str(exc.value)
+
+
+@pytest.mark.parametrize("field", ["name", "version", "author"])
+@pytest.mark.parametrize(
+    "value", ["{actions: [trip_relay]}", "[a, b]", "1.0", "2", "true", "2026-10-19"]
+)
+@pytest.mark.parametrize("as_json", [False, True])
+def test_non_string_metadata_exits_failed(
+    tmp_path: Path, field: str, value: str, as_json: bool, monkeypatch, capsys
+) -> None:
+    """skill.yaml name, version and author are strings, never str() of another type."""
+    monkeypatch.setattr(
+        "ori.skills.loader.SkillLoader._is_core_bundled_skill",
+        lambda self, skill_dir: True,
+    )
+    skill_dir = tmp_path / "bad-metadata"
+    _write_skill_with_metadata(skill_dir, field, value)
+
+    rc = main(["skills", "validate", str(skill_dir)] + (["--json"] if as_json else []))
+
+    captured = capsys.readouterr()
+    assert rc == EXIT_FAILED
+    _assert_no_traceback(captured)
+    if as_json:
+        doc = _read_json(captured)
+        assert doc["status"] == "invalid"
+        message = json.dumps(doc)
+    else:
+        message = captured.out + captured.err
+    assert f"{field} must be a string" in message
+    assert ("quote the value" in message) is (not value.startswith(("{", "[")))
+    assert ("trip-relay" if field != "name" else "bad-metadata") in message
