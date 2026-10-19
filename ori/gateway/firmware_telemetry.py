@@ -18,7 +18,12 @@ import logging
 from concurrent.futures import Future as ConcurrentFuture
 from typing import Any, Callable, cast
 
-from ori.gateway.mqtt_security import apply_tls_context, parse_gateway_broker_url
+from ori.gateway.mqtt_retry import (
+    MqttSession,
+    serve_with_reconnect,
+    start_mqtt_client,
+)
+from ori.gateway.mqtt_security import parse_gateway_broker_url
 from ori.hal.base import MeasurementRefusedError, refuse_unusable_reading
 from ori.network.deduplicator import EventDeduplicator
 from ori.network.event_bus import EventBus
@@ -104,36 +109,26 @@ class MqttFirmwareTelemetrySubscriber:
 
     async def serve_until(self, shutdown_event: asyncio.Event) -> None:
         self._loop = asyncio.get_running_loop()
+        await serve_with_reconnect(
+            shutdown_event,
+            connect=self._connect,
+            close=self.close,
+            log=logger,
+            service="firmware-telemetry",
+        )
+
+    async def _connect(self, session: MqttSession) -> Any:
         client = self._client_factory(client_id=f"ori-fw-{self._runtime_device_id}")
         self._client = client
-        client.on_connect = self._on_connect
-        client.on_message = self._on_message
-        try:
-            if self._broker.username:
-                client.username_pw_set(self._broker.username, self._broker.password)
-            apply_tls_context(client, self._broker)
-            await asyncio.to_thread(
-                client.connect,
-                self._broker.host,
-                int(self._broker.port),
-                60,
-            )
-            await asyncio.to_thread(client.loop_start)
-            logger.info(
-                "[firmware-telemetry] subscribed to %s via %s:%s",
-                self._topic,
-                self._broker.host,
-                self._broker.port,
-            )
-            await shutdown_event.wait()
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception(
-                "[firmware-telemetry] MQTT subscriber stopped unexpectedly"
-            )
-        finally:
-            await self.close()
+        session.bind(client, on_connect=self._on_connect, on_message=self._on_message)
+        await start_mqtt_client(client, self._broker)
+        logger.info(
+            "[firmware-telemetry] subscribed to %s via %s:%s",
+            self._topic,
+            self._broker.host,
+            self._broker.port,
+        )
+        return client
 
     async def close(self) -> None:
         client = self._client

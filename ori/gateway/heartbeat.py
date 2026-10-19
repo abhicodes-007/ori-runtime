@@ -40,7 +40,12 @@ import asyncio
 import logging
 from typing import Any, Callable
 
-from ori.gateway.mqtt_security import apply_tls_context, parse_gateway_broker_url
+from ori.gateway.mqtt_retry import (
+    MqttSession,
+    serve_with_reconnect,
+    start_mqtt_client,
+)
+from ori.gateway.mqtt_security import parse_gateway_broker_url
 from ori.gateway.payload_bounds import GATEWAY_HEALTH, IngressBound
 from ori.reasoning.capability_posture import CapabilityPostureTracker
 from ori.security.gateway_messages import (
@@ -114,37 +119,27 @@ class MqttGatewayHeartbeatSubscriber:
         so the runtime can manage both servers with the same lifecycle pattern.
         """
         self._loop = asyncio.get_running_loop()
+        await serve_with_reconnect(
+            shutdown_event,
+            connect=self._connect,
+            close=self.close,
+            log=logger,
+            service="gateway-heartbeat",
+        )
+
+    async def _connect(self, session: MqttSession) -> Any:
         client = self._client_factory(client_id=f"ori-hb-{self._device_id}")
         self._client = client
-        client.on_connect = self._on_connect
-        client.on_message = self._on_message
-        try:
-            username = self._broker.username
-            password = self._broker.password
-            if username:
-                client.username_pw_set(username, password)
-            apply_tls_context(client, self._broker)
-            await asyncio.to_thread(
-                client.connect,
-                self._broker.host,
-                int(self._broker.port),
-                60,
-            )
-            await asyncio.to_thread(client.loop_start)
-            logger.info(
-                "[gateway-heartbeat] subscribed to %s via %s:%s (auth=%s)",
-                GATEWAY_HEALTH_TOPIC,
-                self._broker.host,
-                self._broker.port,
-                "enabled" if self._authenticator is not None else "disabled",
-            )
-            await shutdown_event.wait()
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("[gateway-heartbeat] MQTT subscriber stopped unexpectedly")
-        finally:
-            await self.close()
+        session.bind(client, on_connect=self._on_connect, on_message=self._on_message)
+        await start_mqtt_client(client, self._broker)
+        logger.info(
+            "[gateway-heartbeat] subscribed to %s via %s:%s (auth=%s)",
+            GATEWAY_HEALTH_TOPIC,
+            self._broker.host,
+            self._broker.port,
+            "enabled" if self._authenticator is not None else "disabled",
+        )
+        return client
 
     async def close(self) -> None:
         """Stop the paho network loop and disconnect cleanly."""
